@@ -6,7 +6,7 @@ require('simple_html_dom.php');
 require('config.php');
 
 $url = 'https://banking.dkb.de';
-define('CSV_HEADER_LINES', 7);
+define('CSV_HEADER_LINES', 6);
 define('CSV_EC_COLUMN_DATE', 0);
 define('CSV_EC_COLUMN_DATE2', 1);
 define('CSV_EC_COLUMN_SUBJECT1', 3);
@@ -15,6 +15,15 @@ define('CSV_EC_COLUMN_VALUE', 7);
 define('CSV_CC_COLUMN_DATE', 2);
 define('CSV_CC_COLUMN_SUBJECT', 3);
 define('CSV_CC_COLUMN_VALUE', 4);
+define('CSV_COLUMN_NAME_VALUE', 'Betrag (EUR)');
+define('CSV_COLUMN_NAME_RECEIVER', 'Auftraggeber / Begünstigter');
+
+function csvLineToArray($line)
+{
+	$data = explode(';', $line);
+	$data = array_map(function($e){return trim($e, '" ><');}, $data);
+	return $data;
+}
 
 function doCurlPost($action, $data) {
 	global $url, $ch;
@@ -52,6 +61,113 @@ function findLineInCSV($line, $csv) {
 
 	return false;
 }
+
+function getCsvFile($account)
+{
+	return __DIR__ . '/data/' . $account['nr'];
+}
+
+function processAccount($account)
+{
+	$cnt = 0;
+	$file = getCsvFile($account);
+	$lines = explode("\n", $account['csv']);
+
+	$exists = file_exists($file);
+	$csv = $exists? file($file, FILE_IGNORE_NEW_LINES) : false;
+	file_put_contents($file, $account['csv']);
+	if (!$exists)
+	{
+		// no push on first run. just save the csv for later comparison
+		return;
+	}
+	
+	$push = array();
+
+	foreach ($lines as $k => $line) {
+		if ($k < CSV_HEADER_LINES || !$line) continue;
+		if ($k < (CSV_HEADER_LINES+1) || !$line)
+		{
+			$headers  = csvLineToArray($line);
+			# print_r($headers);
+			continue;
+		}
+
+		$columns = csvLineToArray($line);
+		foreach ($headers as $i => $k)
+		{
+			$data[$k] = $columns[$i];
+		}
+
+		$lineNbr = findLineInCSV($line, $csv);
+		if ($lineNbr === false)
+		{
+			// if (++$cnt >= 100) break; // no more than $maxMessages push messages per account per run
+			
+			$transaction = array(
+				account => $account['desc'], 
+				keys => $headers,
+				data => $data,
+			);
+			
+			# print_r($transaction);
+			
+			$push[] = $transaction;
+		}
+	}
+	
+	return $push;
+}
+
+function push($transactions)
+{
+	global $smtp, $from, $to;
+
+	foreach ($transactions as $transaction)
+	{
+		$bodyLines = array();
+		
+		print_r($transaction);
+		
+		foreach ($transaction[keys] as $i => $k)
+		{
+			$bodyLines[] = $k . ': ' . $transaction[data][$k];
+		}
+		
+		$body  = implode("\n", $bodyLines); 
+	
+		$headers = array(
+			'From' => $from,
+			'To' => $to,
+			'Subject' => $transaction[account] . ": " . $transaction[data][CSV_COLUMN_NAME_VALUE] . " " . $transaction[data][CSV_COLUMN_NAME_RECEIVER],
+		);
+	
+		echo 'Send ' . $headers[Subject] . "\n";
+		$mail = $smtp->send($to, $headers, $body);
+	}
+	
+		$headers = array(
+			'From' => $from,
+			'To' => $to,
+			'Subject' => 'dkb-crawl.php complete',
+		);
+
+		$mail = $smtp->send($to, $headers, '');
+}
+
+function test()
+{
+$account = array(
+	'nr' => '0016167710',
+	'desc' => 'Kreditkarte',
+);
+	$account['csv'] = file_get_contents(GetCsvFile($account));
+	# print_r($account);
+	$ts  = processAccount($account);
+	push($ts);
+}
+
+# test(); return;
 
 //
 // CURL init
@@ -170,7 +286,7 @@ foreach ($dom_->find('table[class=financialStatusTable] tr') as $k => $row) {
 	$accounts[$nr] = ['desc' => $desc, 'csv' => $csv, 'nr' => $nr, 'type' => $ec?'ec':'cc'];
 }
 
-#print_r($accounts);
+# print_r($accounts);
 
 //
 // Logout
@@ -185,77 +301,14 @@ $html = doCurlGet($url . $href);
 // Parse CSV
 //
 echo "Parse CSV\n";
-$push = array();
-foreach ($accounts as $account) {
-	$cnt = 0;
-	$lines = explode("\n", $account['csv']);
-
-	$exists = file_exists($file = __DIR__ . '/data/' . $account['nr']);
-	$csv = $exists? file($file, FILE_IGNORE_NEW_LINES) : false;
-	file_put_contents($file, $account['csv']);
-	if (!$exists) {
-		// no push on first run. just save the csv for later comparison
-		continue;
-	}
-
-	foreach ($lines as $k => $line) {
-		if ($k < CSV_HEADER_LINES || !$line) continue;
-
-		$data = explode(';', $line);
-		$data = array_map(function($e){return trim($e, '" ><');}, $data);
-
-		$lineNbr = findLineInCSV($line, $csv);
-		if ($lineNbr === false) {
-			// push
-			if (++$cnt >= 5) break; // no more than 5 push messages per account per run
-			echo $str = "    new entry: $line\n";
-		
-			if ($account['type'] == 'ec') {
-				// Strip CC data out of Verwendungszweck
-				$data[CSV_EC_COLUMN_SUBJECT2] = preg_replace('#(\d{4}) \d{4} \d{4} (\d{4})#', '$1 XXXX XXXX $2', $data[CSV_EC_COLUMN_SUBJECT2]);
-
-				$push[] = array(
-					$account['desc'], 
-					$data[CSV_EC_COLUMN_DATE], 
-					$data[CSV_EC_COLUMN_SUBJECT1] . ' ' . $data[CSV_EC_COLUMN_SUBJECT2],
-					$data[CSV_EC_COLUMN_VALUE]
-				);
-			} else {
-				$push[] = array(
-					$account['desc'], 
-					$data[CSV_CC_COLUMN_DATE], 
-					$data[CSV_CC_COLUMN_SUBJECT], 
-					$data[CSV_CC_COLUMN_VALUE]
-				);
-			}
-		} else if ($account['type'] == 'cc' || $data[CSV_EC_COLUMN_DATE2]) {
-			// in the CSV file of EC cards, predated payments appear on top. Predated payments have an empty CSV_EC_COLUMN_DATE2 column.
-			// so we have to always look below them for possibly new transactions
-			break;
-		}
-	}
+$transactions = array();
+foreach ($accounts as $account) 
+{
+	$transactions = array_merge($transactions, processAccount($account));
 }
+push($transactions);
+print_r($accounts);
 
-//
-// Push
-//
-echo "PUSH via Boxcar\n";
-foreach ($push as $k => $elem) {	
-	if ($k && $k%3 == 0) {
-		echo "Sleeping..\n";
-		sleep(10);
-	}
-	list($desc, $date, $subject, $value) = $elem;
-	$color = $value[0] == '-' ? 'red' : 'green';
-	
-	$title = $desc . ' ' . $value . ' Euro';
-	$message = '<b>'.$date . '</b><br>' . $subject . '<br><br><b style="color:'.$color.'">' . $value . ' Euro</b>'; 
-	
-	$cmd = 'curl --silent -d "user_credentials='.$boxcar_token.'&notification[title]='.urlencode($title).'&notification[long_message]='.urlencode($message).'&notification[sound]=cash" https://new.boxcar.io/api/notifications';
-	echo $cmd;
-	echo exec($cmd);
-	echo "\n";
-}
 ?>
 
 
